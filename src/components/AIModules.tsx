@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import React, { useState } from "react";
+import React, { useState, useEffect } from "react";
 import { motion } from "motion/react";
 import {
   Brain,
@@ -17,12 +17,54 @@ import {
   FileWarning,
   CheckCircle,
   HelpCircle,
-  TrendingDown
+  TrendingDown,
+  Database,
+  Check,
+  AlertTriangle,
+  Server
 } from "lucide-react";
 import { ReportAnalysisResult } from "../types";
 
 export default function AIModules() {
-  const [activeTab, setActiveTab] = useState<"doctor" | "checker" | "analyzer">("doctor");
+  const [activeTab, setActiveTab] = useState<"doctor" | "checker" | "analyzer" | "database">("doctor");
+
+  // State: AWS DynamoDB Sync Logs
+  const [dbLogs, setDbLogs] = useState<any[]>([]);
+  const [dbLoading, setDbLoading] = useState(false);
+  const [dbStatus, setDbStatus] = useState<{ success: boolean; message: string; table?: string }>({
+    success: false,
+    message: "Initializing database connection status..."
+  });
+
+  // Fetch DynamoDB logs from our express backend API
+  const fetchDbLogs = async () => {
+    setDbLoading(true);
+    try {
+      const res = await fetch("/api/db/logs");
+      const data = await res.json();
+      if (data.success) {
+        setDbLogs(data.logs || []);
+        setDbStatus({ success: true, message: data.message });
+      } else {
+        setDbStatus({ success: false, message: data.message });
+      }
+    } catch (err: any) {
+      console.error(err);
+      setDbStatus({
+        success: false,
+        message: "Unable to reach express API serverless function. Please deploy and configure environment variables."
+      });
+    } finally {
+      setDbLoading(false);
+    }
+  };
+
+  // Fetch logs whenever user loads the database tab
+  useEffect(() => {
+    if (activeTab === "database") {
+      fetchDbLogs();
+    }
+  }, [activeTab]);
 
   // State: AI Doctor Q&A
   const [chatInput, setChatInput] = useState("");
@@ -68,17 +110,27 @@ export default function AIModules() {
         }),
       });
 
-      const data = await response.json();
-      if (data.error) {
-        throw new Error(data.error);
+      if (!response.ok) {
+        let errMsg = `HTTP Error ${response.status}`;
+        try {
+          const errData = await response.json();
+          if (errData.error) errMsg += `: ${errData.error}`;
+        } catch {
+          try {
+            const errText = await response.text();
+            if (errText) errMsg += `: ${errText.substring(0, 150)}`;
+          } catch {}
+        }
+        throw new Error(errMsg);
       }
 
+      const data = await response.json();
       setChatHistory((prev) => [...prev, { sender: "ai", text: data.text || "No response received." }]);
     } catch (err: any) {
       console.error(err);
       setChatHistory((prev) => [
         ...prev,
-        { sender: "ai", text: "Error: Failed to fetch response. Please verify your internet connection or backend configuration." },
+        { sender: "ai", text: `Error: ${err.message || "Failed to fetch response."}. Please verify your internet connection or backend configuration.` },
       ]);
     } finally {
       setChatLoading(false);
@@ -104,13 +156,25 @@ export default function AIModules() {
         }),
       });
 
-      const data = await response.json();
-      if (data.error) throw new Error(data.error);
+      if (!response.ok) {
+        let errMsg = `HTTP Error ${response.status}`;
+        try {
+          const errData = await response.json();
+          if (errData.error) errMsg += `: ${errData.error}`;
+        } catch {
+          try {
+            const errText = await response.text();
+            if (errText) errMsg += `: ${errText.substring(0, 150)}`;
+          } catch {}
+        }
+        throw new Error(errMsg);
+      }
 
+      const data = await response.json();
       setCheckerResult(data.text);
     } catch (err: any) {
       console.error(err);
-      setCheckerResult("Error calculating diagnosis. Please verify your backend API key settings.");
+      setCheckerResult(`Error calculating diagnosis: ${err.message || "Failed to fetch response"}. Please verify your backend API key settings.`);
     } finally {
       setCheckerLoading(false);
     }
@@ -224,6 +288,21 @@ export default function AIModules() {
           </div>
           {activeTab === "analyzer" && (
             <span className="absolute bottom-0 left-0 w-full h-0.5 bg-pink-500 rounded-full" />
+          )}
+        </button>
+
+        <button
+          onClick={() => setActiveTab("database")}
+          className={`pb-3 text-sm font-semibold relative cursor-pointer ${
+            activeTab === "database" ? "text-amber-400" : "text-[#c3c6d7]/50 hover:text-white"
+          }`}
+        >
+          <div className="flex items-center gap-2">
+            <Database className="w-4 h-4 text-amber-500" />
+            <span>AWS DynamoDB Cloud Sync</span>
+          </div>
+          {activeTab === "database" && (
+            <span className="absolute bottom-0 left-0 w-full h-0.5 bg-amber-500 rounded-full" />
           )}
         </button>
       </div>
@@ -559,7 +638,185 @@ export default function AIModules() {
             </div>
           </div>
         )}
+
+        {/* TAB 4: AWS DYNAMODB CLOUD SYNC */}
+        {activeTab === "database" && (
+          <div className="space-y-6">
+            {/* Status and Configuration Panel */}
+            <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
+              {/* Connection Status Card */}
+              <div className="lg:col-span-5 bg-[#111827]/60 border border-white/5 backdrop-blur-md rounded-3xl p-6 flex flex-col justify-between shadow-lg">
+                <div className="space-y-4">
+                  <div className="flex items-center gap-3">
+                    <div className={`p-3 rounded-2xl ${dbStatus.success ? 'bg-amber-500/10 text-amber-400' : 'bg-rose-500/10 text-rose-400'}`}>
+                      <Server className="w-6 h-6 animate-pulse" />
+                    </div>
+                    <div>
+                      <h3 className="text-lg font-bold text-white">AWS Integration Status</h3>
+                      <p className="text-xs text-[#c3c6d7]/40">Active DB Connection Check</p>
+                    </div>
+                  </div>
+
+                  <hr className="border-white/5" />
+
+                  <div className="space-y-2.5">
+                    <div className="flex justify-between items-center text-xs">
+                      <span className="text-[#c3c6d7]/60">AWS Database Engine:</span>
+                      <span className="font-semibold text-white font-mono">Amazon DynamoDB</span>
+                    </div>
+                    <div className="flex justify-between items-center text-xs">
+                      <span className="text-[#c3c6d7]/60">Status:</span>
+                      <span className={`flex items-center gap-1.5 font-bold px-2.5 py-0.5 rounded-full text-[10px] ${
+                        dbStatus.success 
+                          ? 'bg-emerald-500/10 text-emerald-400 border border-emerald-500/20' 
+                          : 'bg-amber-500/10 text-amber-400 border border-amber-500/20'
+                      }`}>
+                        <span className={`w-1.5 h-1.5 rounded-full ${dbStatus.success ? 'bg-emerald-400' : 'bg-amber-400 animate-ping'}`} />
+                        {dbStatus.success ? "ACTIVE CLOUD SYNC" : "OFFLINE / LOCAL STATE"}
+                      </span>
+                    </div>
+                    <div className="flex justify-between items-center text-xs">
+                      <span className="text-[#c3c6d7]/60">Target Table Name:</span>
+                      <span className="font-semibold text-[#06b6d4] font-mono">pulsemind_health_logs</span>
+                    </div>
+                  </div>
+
+                  <div className="p-4 rounded-2xl bg-[#020617]/50 border border-white/5">
+                    <p className="text-xs text-[#dae2fd]/80 leading-relaxed font-light">
+                      {dbStatus.message}
+                    </p>
+                  </div>
+                </div>
+
+                <div className="mt-6">
+                  <button
+                    onClick={fetchDbLogs}
+                    disabled={dbLoading}
+                    className="w-full bg-amber-600 hover:bg-amber-500 active:scale-[0.98] disabled:opacity-50 text-white font-semibold text-sm py-3 rounded-2xl flex items-center justify-center gap-2 cursor-pointer transition-all"
+                  >
+                    <RefreshCw className={`w-4 h-4 ${dbLoading ? 'animate-spin' : ''}`} />
+                    <span>Fetch Live AWS Stream</span>
+                  </button>
+                </div>
+              </div>
+
+              {/* AWS + Vercel Architecture and Setup Instructions */}
+              <div className="lg:col-span-7 bg-[#111827]/60 border border-white/5 backdrop-blur-md rounded-3xl p-6 shadow-lg">
+                <h3 className="text-base font-bold text-white mb-4 flex items-center gap-2">
+                  <Shield className="w-5 h-5 text-blue-400" />
+                  Hackathon AWS & Vercel Integration Guide
+                </h3>
+                
+                <div className="space-y-4 text-xs font-light text-[#dae2fd]/80 leading-relaxed">
+                  <p>
+                    PulseMind AI is fully programmed for the <strong>#H0 AWS Vercel Hackathon</strong>. Every clinical Q&A prompt and parsed medical report creates an automated transaction log pushed live to <strong>Amazon DynamoDB</strong>.
+                  </p>
+
+                  <div className="space-y-2">
+                    <span className="text-[10px] text-amber-400 font-bold uppercase tracking-wider block">How to configure AWS database on Vercel:</span>
+                    <ol className="list-decimal pl-4 space-y-2">
+                      <li>
+                        Create an Amazon DynamoDB table in your <strong>AWS Console</strong> with Table Name: <code className="text-[#06b6d4] font-bold font-mono">pulsemind_health_logs</code> and Partition Key / Primary Key: <code className="text-[#06b6d4] font-bold font-mono">id</code> (Type: String).
+                      </li>
+                      <li>
+                        Go to your <strong>Vercel Dashboard</strong> &rarr; Select your project &rarr; <strong>Settings &rarr; Environment Variables</strong>.
+                      </li>
+                      <li>
+                        Add the following three variables:
+                        <ul className="list-disc pl-4 mt-1 space-y-1 font-mono text-[11px] text-white/90">
+                          <li><span className="text-amber-400">AWS_ACCESS_KEY_ID</span> = <span className="text-cyan-400">"your-access-key-id"</span></li>
+                          <li><span className="text-amber-400">AWS_SECRET_ACCESS_KEY</span> = <span className="text-cyan-400">"your-secret-access-key"</span></li>
+                          <li><span className="text-amber-400">AWS_REGION</span> = <span className="text-cyan-400">"us-east-1"</span> (or your chosen AWS region)</li>
+                        </ul>
+                      </li>
+                      <li>
+                        <strong>Trigger a new deploy</strong> on Vercel. Now, all user actions will be synced live to Amazon Web Services!
+                      </li>
+                    </ol>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            {/* Live Logs Datatable Card */}
+            <div className="bg-[#111827]/60 border border-white/5 backdrop-blur-md rounded-3xl p-6 shadow-lg">
+              <div className="flex justify-between items-center mb-4">
+                <div>
+                  <h3 className="text-lg font-bold text-white flex items-center gap-2">
+                    <Database className="w-5 h-5 text-amber-400" />
+                    Live Cloud Sync Stream Logs
+                  </h3>
+                  <p className="text-xs text-[#c3c6d7]/40 mt-0.5">Real-time table view of items pulled from Amazon DynamoDB</p>
+                </div>
+                <span className="text-[10px] bg-amber-500/10 text-amber-400 px-3 py-1 border border-amber-500/20 rounded-full font-bold">
+                  {dbLogs.length} Records Detected
+                </span>
+              </div>
+
+              {dbLogs.length > 0 ? (
+                <div className="overflow-x-auto">
+                  <table className="w-full text-left text-xs">
+                    <thead>
+                      <tr className="border-b border-white/10 text-[#c3c6d7]/40 uppercase tracking-wider text-[10px]">
+                        <th className="pb-3 font-semibold">Log ID</th>
+                        <th className="pb-3 font-semibold">Transaction Event</th>
+                        <th className="pb-3 font-semibold">Cloud Timestamp</th>
+                        <th className="pb-3 font-semibold">Transaction Details</th>
+                        <th className="pb-3 font-semibold text-right">AWS State</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-white/5">
+                      {dbLogs.map((log) => (
+                        <tr key={log.id} className="hover:bg-white/5">
+                          <td className="py-3 font-mono text-[#c3c6d7]/50 max-w-[120px] truncate" title={log.id}>
+                            {log.id}
+                          </td>
+                          <td className="py-3">
+                            <span className={`inline-block px-2.5 py-0.5 rounded-full text-[9px] font-extrabold uppercase tracking-wider ${
+                              log.type === "chat_message"
+                                ? "bg-blue-500/15 text-blue-400 border border-blue-500/20"
+                                : "bg-pink-500/15 text-pink-400 border border-pink-500/20"
+                            }`}>
+                              {log.type === "chat_message" ? "AI Chat Prompt" : "OCR Report Parse"}
+                            </span>
+                          </td>
+                          <td className="py-3 text-[#c3c6d7]/70 font-light">
+                            {new Date(log.timestamp).toLocaleString()}
+                          </td>
+                          <td className="py-3 text-[#dae2fd]/85 max-w-[300px] truncate">
+                            {log.type === "chat_message" 
+                              ? `Prompt: "${log.message}"` 
+                              : `File: "${log.fileName}" | Patient: "${log.patientName}"`}
+                          </td>
+                          <td className="py-3 text-right">
+                            <span className="inline-flex items-center gap-1 text-xs text-emerald-400 font-bold font-sans">
+                              <Check className="w-3.5 h-3.5" />
+                              AWS Synced
+                            </span>
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              ) : (
+                <div className="flex flex-col items-center justify-center text-center py-16 text-[#c3c6d7]/40 space-y-3">
+                  <Database className="w-12 h-12 stroke-[1.2] text-[#c3c6d7]/25" />
+                  <div>
+                    <p className="text-sm font-semibold text-white/70">No logs found in DynamoDB</p>
+                    <p className="text-xs max-w-sm mt-1">
+                      {dbStatus.success 
+                        ? "The DynamoDB table is active and ready! Chat with PulseMind AI or analyze a medical report to see your actions automatically logged above!"
+                        : "Connect your AWS Database to Vercel following the guide above to sync local user transactions to the cloud."}
+                    </p>
+                  </div>
+                </div>
+              )}
+            </div>
+          </div>
+        )}
       </div>
     </div>
   );
 }
+
