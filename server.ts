@@ -48,6 +48,68 @@ function getGeminiClient(): GoogleGenAI {
   return aiClient;
 }
 
+// Robust helper function with retry logic and fallback models to handle 503 high demand or other transient API issues
+async function generateContentWithFallback(
+  contents: any,
+  config?: any,
+  preferredModel: string = "gemini-3.5-flash"
+): Promise<any> {
+  const modelsToTry = [
+    preferredModel,
+    "gemini-flash-latest",
+    "gemini-3.1-flash-lite"
+  ];
+
+  let lastError: any = null;
+
+  for (const model of modelsToTry) {
+    let attempts = 0;
+    const maxAttempts = 2; // Try twice per model
+    let delay = 1000; // Starting delay of 1 second
+
+    while (attempts < maxAttempts) {
+      try {
+        console.log(`[PulseMind AI] Attempting generation using model: ${model} (Attempt ${attempts + 1}/${maxAttempts})...`);
+        const ai = getGeminiClient();
+        const response = await ai.models.generateContent({
+          model: model,
+          contents: contents,
+          config: config,
+        });
+        console.log(`[PulseMind AI] Generation successful using model: ${model}`);
+        return response;
+      } catch (err: any) {
+        lastError = err;
+        attempts++;
+        console.warn(`[PulseMind AI] Error with model ${model} on attempt ${attempts}:`, err.message || err);
+
+        // Detect if error is transient (e.g. 503 UNAVAILABLE, 429 RESOURCE_EXHAUSTED, high demand, etc.)
+        const isTransient = 
+          err.status === 503 || 
+          err.statusCode === 503 ||
+          err.message?.includes("503") ||
+          err.message?.includes("UNAVAILABLE") ||
+          err.message?.includes("high demand") ||
+          err.status === 429 ||
+          err.statusCode === 429 ||
+          err.message?.includes("429") ||
+          err.message?.includes("RESOURCE_EXHAUSTED");
+
+        if (isTransient && attempts < maxAttempts) {
+          console.log(`[PulseMind AI] Transient error detected. Retrying model ${model} in ${delay}ms...`);
+          await new Promise((resolve) => setTimeout(resolve, delay));
+          delay *= 2; // Exponential backoff
+        } else {
+          // Break the inner loop to try the next fallback model immediately
+          break;
+        }
+      }
+    }
+  }
+
+  throw lastError || new Error("All generative models failed to respond.");
+}
+
 // AWS DynamoDB Client Initializer
 let ddbDocClient: DynamoDBDocumentClient | null = null;
 function getDynamoDBClient(): DynamoDBDocumentClient | null {
@@ -128,17 +190,15 @@ app.post(["/api/gemini/chat", "/gemini/chat"], async (req, res) => {
       return res.status(400).json({ error: "Message is required." });
     }
 
-    const ai = getGeminiClient();
-    
-    // We can use simple generateContent with system instruction
-    const response = await ai.models.generateContent({
-      model: "gemini-3.5-flash",
-      contents: message,
-      config: {
+    // Use our robust helper function that supports retry and fallbacks
+    const response = await generateContentWithFallback(
+      message,
+      {
         systemInstruction: systemInstruction || "You are PulseMind AI, a clinical-grade health coach. Provide accurate, helpful, and scientific information.",
         temperature: 0.7,
       },
-    });
+      "gemini-3.5-flash"
+    );
 
     // Fire-and-forget logging to AWS DynamoDB
     logToDynamoDB("chat_message", {
@@ -162,8 +222,6 @@ app.post(["/api/gemini/analyze-report", "/gemini/analyze-report"], async (req, r
       return res.status(400).json({ error: "fileData (base64) and mimeType are required." });
     }
 
-    const ai = getGeminiClient();
-    
     const filePart = {
       inlineData: {
         mimeType: mimeType,
@@ -188,13 +246,14 @@ Return a JSON response containing:
 Your response must be VALID JSON ONLY. Do not wrap in markdown blocks, do not include any text before or after the JSON.`,
     };
 
-    const response = await ai.models.generateContent({
-      model: "gemini-3.5-flash",
-      contents: [filePart, promptPart],
-      config: {
+    // Use our robust helper function that supports retry and fallbacks
+    const response = await generateContentWithFallback(
+      [filePart, promptPart],
+      {
         responseMimeType: "application/json",
       },
-    });
+      "gemini-3.5-flash"
+    );
 
     // Parse the JSON text returned from the model
     let parsedData: any = {};
