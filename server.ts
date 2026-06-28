@@ -31,8 +31,13 @@ function getGeminiClient(): GoogleGenAI {
     } else {
       console.warn("[PulseMind API Key] WARNING: GEMINI_API_KEY is not defined in the environment.");
     }
+
+    if (!apiKey || apiKey === "MOCK_KEY") {
+      throw new Error("GEMINI_API_KEY environment variable is not defined or is invalid. Please configure it in your Vercel Project Settings (Environment Variables) and deploy a new version.");
+    }
+
     aiClient = new GoogleGenAI({
-      apiKey: apiKey || "MOCK_KEY",
+      apiKey: apiKey,
       httpOptions: {
         headers: {
           "User-Agent": "aistudio-build",
@@ -262,36 +267,5 @@ app.get(["/api/db/logs", "/db/logs"], async (req, res) => {
     });
   }
 });
-
-// Start either Vite dev server or serve static assets in production
-async function bootstrap() {
-  if (process.env.NODE_ENV !== "production") {
-    const { createServer: createViteServer } = await import("vite");
-    const vite = await createViteServer({
-      server: { middlewareMode: true },
-      appType: "spa",
-    });
-    app.use(vite.middlewares);
-    console.log("Vite development server mounted as middleware");
-  } else {
-    const distPath = path.join(process.cwd(), "dist");
-    app.use(express.static(distPath));
-    app.get("*", (req, res) => {
-      res.sendFile(path.join(distPath, "index.html"));
-    });
-    console.log("Serving static production assets from:", distPath);
-  }
-
-  app.listen(PORT, "0.0.0.0", () => {
-    console.log(`PulseMind AI Server booting successfully on http://localhost:${PORT}`);
-  });
-}
-
-if (!process.env.VERCEL) {
-  bootstrap().catch((err) => {
-    console.error("Critical server bootstrap failure:", err);
-    process.exit(1);
-  });
-}
 
 export default app;
