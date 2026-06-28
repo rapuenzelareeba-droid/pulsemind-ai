@@ -113,14 +113,20 @@ export default function AIModules() {
       if (!response.ok) {
         let errMsg = `HTTP Error ${response.status}`;
         try {
-          const errData = await response.json();
-          if (errData.error) errMsg += `: ${errData.error}`;
-        } catch {
+          const errText = await response.text();
           try {
-            const errText = await response.text();
-            if (errText) errMsg += `: ${errText.substring(0, 150)}`;
-          } catch {}
-        }
+            const errData = JSON.parse(errText);
+            if (errData && errData.error) {
+              errMsg += `: ${errData.error}`;
+            } else if (errText) {
+              errMsg += `: ${errText.substring(0, 150)}`;
+            }
+          } catch {
+            if (errText) {
+              errMsg += `: ${errText.substring(0, 150)}`;
+            }
+          }
+        } catch {}
         throw new Error(errMsg);
       }
 

@@ -2,6 +2,8 @@ import express from "express";
 import path from "path";
 import dotenv from "dotenv";
 import { GoogleGenAI } from "@google/genai";
+import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
+import { DynamoDBDocumentClient, PutCommand, ScanCommand } from "@aws-sdk/lib-dynamodb";
 
 dotenv.config();
 
@@ -16,9 +18,18 @@ app.use(express.urlencoded({ extended: true, limit: "20mb" }));
 let aiClient: GoogleGenAI | null = null;
 function getGeminiClient(): GoogleGenAI {
   if (!aiClient) {
-    const apiKey = process.env.GEMINI_API_KEY;
-    if (!apiKey) {
-      console.warn("WARNING: GEMINI_API_KEY is not defined in the environment.");
+    let apiKey = process.env.GEMINI_API_KEY;
+    if (apiKey) {
+      const originalLength = apiKey.length;
+      const cleanKey = apiKey.replace(/^['"]|['"]$/g, "").trim();
+      if (cleanKey !== apiKey) {
+        console.log(`[PulseMind API Key] Detected and stripped wrapping quotes from GEMINI_API_KEY. Length changed from ${originalLength} to ${cleanKey.length}.`);
+        apiKey = cleanKey;
+      } else {
+        console.log(`[PulseMind API Key] GEMINI_API_KEY loaded. Length: ${apiKey.length} characters.`);
+      }
+    } else {
+      console.warn("[PulseMind API Key] WARNING: GEMINI_API_KEY is not defined in the environment.");
     }
     aiClient = new GoogleGenAI({
       apiKey: apiKey || "MOCK_KEY",
@@ -30,6 +41,73 @@ function getGeminiClient(): GoogleGenAI {
     });
   }
   return aiClient;
+}
+
+// AWS DynamoDB Client Initializer
+let ddbDocClient: DynamoDBDocumentClient | null = null;
+function getDynamoDBClient(): DynamoDBDocumentClient | null {
+  if (ddbDocClient) return ddbDocClient;
+
+  let accessKeyId = process.env.AWS_ACCESS_KEY_ID;
+  let secretAccessKey = process.env.AWS_SECRET_ACCESS_KEY;
+  let region = process.env.AWS_REGION || "us-east-1";
+
+  if (accessKeyId) {
+    accessKeyId = accessKeyId.replace(/^['"]|['"]$/g, "").trim();
+  }
+  if (secretAccessKey) {
+    secretAccessKey = secretAccessKey.replace(/^['"]|['"]$/g, "").trim();
+  }
+  if (region) {
+    region = region.replace(/^['"]|['"]$/g, "").trim();
+  }
+
+  if (!accessKeyId || !secretAccessKey) {
+    console.warn("WARNING: AWS_ACCESS_KEY_ID or AWS_SECRET_ACCESS_KEY is not defined. DynamoDB logging is disabled.");
+    return null;
+  }
+
+  try {
+    const client = new DynamoDBClient({
+      region,
+      credentials: {
+        accessKeyId,
+        secretAccessKey,
+      },
+    });
+    ddbDocClient = DynamoDBDocumentClient.from(client);
+    console.log("AWS DynamoDB Document Client initialized successfully with sanitized credentials.");
+    return ddbDocClient;
+  } catch (err) {
+    console.error("Failed to initialize DynamoDB Client:", err);
+    return null;
+  }
+}
+
+// Helper to log event to AWS DynamoDB
+async function logToDynamoDB(type: string, payload: any) {
+  try {
+    const ddb = getDynamoDBClient();
+    if (!ddb) return;
+
+    const tableName = process.env.AWS_DYNAMODB_TABLE_NAME || "pulsemind_health_logs";
+    const logId = `${type}_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`;
+
+    await ddb.send(
+      new PutCommand({
+        TableName: tableName,
+        Item: {
+          id: logId,
+          type,
+          timestamp: new Date().toISOString(),
+          ...payload,
+        },
+      })
+    );
+    console.log(`[AWS DynamoDB] Successfully logged ${type} event: ${logId}`);
+  } catch (err) {
+    console.error("[AWS DynamoDB] Failed to write log:", err);
+  }
 }
 
 // REST Endpoints
@@ -56,6 +134,13 @@ app.post(["/api/gemini/chat", "/gemini/chat"], async (req, res) => {
         temperature: 0.7,
       },
     });
+
+    // Fire-and-forget logging to AWS DynamoDB
+    logToDynamoDB("chat_message", {
+      message: message.substring(0, 500),
+      systemInstruction: systemInstruction || "Default Clinic Coach",
+      aiResponseSummary: response.text ? response.text.substring(0, 500) : "No reply"
+    }).catch(err => console.error("Error calling logToDynamoDB:", err));
 
     res.json({ text: response.text });
   } catch (error: any) {
@@ -107,7 +192,7 @@ Your response must be VALID JSON ONLY. Do not wrap in markdown blocks, do not in
     });
 
     // Parse the JSON text returned from the model
-    let parsedData = {};
+    let parsedData: any = {};
     try {
       parsedData = JSON.parse(response.text || "{}");
     } catch (parseErr) {
@@ -122,10 +207,59 @@ Your response must be VALID JSON ONLY. Do not wrap in markdown blocks, do not in
       };
     }
 
+    // Fire-and-forget logging to AWS DynamoDB
+    logToDynamoDB("medical_report_analysis", {
+      fileName: fileName || "unnamed_report",
+      mimeType: mimeType,
+      patientName: parsedData.patientName || "Unknown Patient",
+      confidence: parsedData.confidence || 90,
+      summary: parsedData.summary ? parsedData.summary.substring(0, 500) : "No summary"
+    }).catch(err => console.error("Error calling logToDynamoDB for report:", err));
+
     res.json(parsedData);
   } catch (error: any) {
     console.error("Gemini Analyze Report Error:", error);
     res.status(500).json({ error: error.message || "Failed to analyze medical report." });
+  }
+});
+
+// Endpoint: Fetch synced cloud logs from Amazon DynamoDB
+app.get(["/api/db/logs", "/db/logs"], async (req, res) => {
+  try {
+    const ddb = getDynamoDBClient();
+    if (!ddb) {
+      return res.json({
+        success: false,
+        message: "Amazon DynamoDB is not yet configured. Please add AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, and AWS_REGION to enable cloud sync.",
+        logs: []
+      });
+    }
+
+    const tableName = process.env.AWS_DYNAMODB_TABLE_NAME || "pulsemind_health_logs";
+    const response = await ddb.send(
+      new ScanCommand({
+        TableName: tableName,
+        Limit: 20
+      })
+    );
+
+    const sortedLogs = (response.Items || []).sort(
+      (a: any, b: any) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime()
+    );
+
+    res.json({
+      success: true,
+      message: `Connected successfully to Amazon DynamoDB! Fetched logs from table '${tableName}'`,
+      logs: sortedLogs
+    });
+  } catch (error: any) {
+    console.error("DynamoDB Fetch Logs Error:", error);
+    res.json({
+      success: false,
+      message: "Connected to DynamoDB but table does not exist yet or permissions are missing.",
+      error: error.message,
+      logs: []
+    });
   }
 });
 
