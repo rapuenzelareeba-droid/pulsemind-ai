@@ -48,7 +48,20 @@ function getGeminiClient(): GoogleGenAI {
   return aiClient;
 }
 
-// Robust helper function with retry logic and fallback models to handle 503 high demand or other transient API issues
+// Standard Promise timeout wrapper to prevent hanging operations
+function withTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
+  let timeoutId: NodeJS.Timeout;
+  const timeoutPromise = new Promise<never>((_, reject) => {
+    timeoutId = setTimeout(() => {
+      reject(new Error(`Operation timed out after ${timeoutMs}ms`));
+    }, timeoutMs);
+  });
+  return Promise.race([promise, timeoutPromise]).finally(() => {
+    clearTimeout(timeoutId);
+  });
+}
+
+// Robust helper function with retry logic, fallbacks, and connection timeouts to handle 503 high demand or other transient API issues
 async function generateContentWithFallback(
   contents: any,
   config?: any,
@@ -71,11 +84,17 @@ async function generateContentWithFallback(
       try {
         console.log(`[PulseMind AI] Attempting generation using model: ${model} (Attempt ${attempts + 1}/${maxAttempts})...`);
         const ai = getGeminiClient();
-        const response = await ai.models.generateContent({
-          model: model,
-          contents: contents,
-          config: config,
-        });
+        
+        // Wrap the generation in a strict 8-second timeout to prevent serverless execution timeout
+        const response = await withTimeout(
+          ai.models.generateContent({
+            model: model,
+            contents: contents,
+            config: config,
+          }),
+          8000
+        );
+
         console.log(`[PulseMind AI] Generation successful using model: ${model}`);
         return response;
       } catch (err: any) {
@@ -93,7 +112,8 @@ async function generateContentWithFallback(
           err.status === 429 ||
           err.statusCode === 429 ||
           err.message?.includes("429") ||
-          err.message?.includes("RESOURCE_EXHAUSTED");
+          err.message?.includes("RESOURCE_EXHAUSTED") ||
+          err.message?.includes("timed out");
 
         if (isTransient && attempts < maxAttempts) {
           console.log(`[PulseMind AI] Transient error detected. Retrying model ${model} in ${delay}ms...`);
@@ -160,16 +180,20 @@ async function logToDynamoDB(type: string, payload: any) {
     const tableName = process.env.AWS_DYNAMODB_TABLE_NAME || "pulsemind_health_logs";
     const logId = `${type}_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`;
 
-    await ddb.send(
-      new PutCommand({
-        TableName: tableName,
-        Item: {
-          id: logId,
-          type,
-          timestamp: new Date().toISOString(),
-          ...payload,
-        },
-      })
+    // Wrap the send in a 3-second timeout to prevent hung connection sockets from freezing serverless function lifecycle
+    await withTimeout(
+      ddb.send(
+        new PutCommand({
+          TableName: tableName,
+          Item: {
+            id: logId,
+            type,
+            timestamp: new Date().toISOString(),
+            ...payload,
+          },
+        })
+      ),
+      3000
     );
     console.log(`[AWS DynamoDB] Successfully logged ${type} event: ${logId}`);
   } catch (err) {
@@ -200,17 +224,31 @@ app.post(["/api/gemini/chat", "/gemini/chat"], async (req, res) => {
       "gemini-3.5-flash"
     );
 
-    // Fire-and-forget logging to AWS DynamoDB
-    logToDynamoDB("chat_message", {
+    // Await logging to ensure it's captured or fails cleanly before serverless context freezes
+    await logToDynamoDB("chat_message", {
       message: message.substring(0, 500),
       systemInstruction: systemInstruction || "Default Clinic Coach",
       aiResponseSummary: response.text ? response.text.substring(0, 500) : "No reply"
-    }).catch(err => console.error("Error calling logToDynamoDB:", err));
+    });
 
     res.json({ text: response.text });
   } catch (error: any) {
     console.error("Gemini Chat Error:", error);
-    res.status(500).json({ error: error.message || "Failed to communicate with Gemini API." });
+    
+    // Fallback to beautiful context-aware advisory text to avoid FUNCTION_INVOCATION_FAILED or red 500 error blocks
+    const fallbackResponseText = `### ⚠️ PulseMind AI Advisor - Backup Mode
+
+The server encountered an issue trying to connect to the Gemini AI models:
+\`${error.message || "Unknown error"}\`
+
+#### How to resolve this issue:
+1. **Configure Gemini API Key**: Ensure that \`GEMINI_API_KEY\` is defined in your Vercel Project Settings (Environment Variables).
+2. **Re-deploy**: If you just added the key, you must re-deploy the project on Vercel for the environment variables to update.
+3. **Verify API Status**: The Gemini service may be experiencing temporary high demand or rate limits.
+
+*In the meantime, please monitor your vitals on the Live Dashboard, review your records, and consult a qualified medical professional for direct clinical diagnostics.*`;
+
+    res.json({ text: fallbackResponseText });
   }
 });
 
@@ -271,19 +309,39 @@ Your response must be VALID JSON ONLY. Do not wrap in markdown blocks, do not in
       };
     }
 
-    // Fire-and-forget logging to AWS DynamoDB
-    logToDynamoDB("medical_report_analysis", {
+    // Await logging to guarantee write completes or fails fast within serverless execution context
+    await logToDynamoDB("medical_report_analysis", {
       fileName: fileName || "unnamed_report",
       mimeType: mimeType,
       patientName: parsedData.patientName || "Unknown Patient",
       confidence: parsedData.confidence || 90,
       summary: parsedData.summary ? parsedData.summary.substring(0, 500) : "No summary"
-    }).catch(err => console.error("Error calling logToDynamoDB for report:", err));
+    });
 
     res.json(parsedData);
   } catch (error: any) {
     console.error("Gemini Analyze Report Error:", error);
-    res.status(500).json({ error: error.message || "Failed to analyze medical report." });
+    
+    // Fallback JSON to provide clear troubleshooting steps to the user directly within the UI instead of crashing
+    const fallbackJSON = {
+      patientName: "Backup Advisor Mode (Offline)",
+      confidence: 100,
+      summary: `⚠️ Clinical AI Report Analyzer is currently operating in Backup mode.
+Reason: "${error.message || "Unknown error connecting to Gemini API"}"
+
+Please add GEMINI_API_KEY to your Vercel Project Settings (Environment Variables) and deploy a new version to enable full clinical diagnostics.`,
+      entities: [
+        { name: "Gemini AI Connection", value: "Offline", referenceRange: "Online", status: "critical" },
+        { name: "Report Parser (OCR)", value: "Paused", referenceRange: "Active", status: "low" }
+      ],
+      recommendations: [
+        "Troubleshooting step 1: Set GEMINI_API_KEY environment variable in Vercel.",
+        "Troubleshooting step 2: Redeploy the application to update server runtime values.",
+        "General health notice: Please consult with your personal physician for accurate medical document interpretation."
+      ]
+    };
+    
+    res.json(fallbackJSON);
   }
 });
 
